@@ -1,11 +1,9 @@
 ### Code for auto annotation of ontology using GPT-3.5+ and few-shot learning
-### contact : aria1th@github / etc
+### contact : aria1th@github / 
 ### 2023-06-09
 ### TODO : model selection exposure, local model handling, Async or multi-threading for faster annotation (maybe 20/s?)
 
 import openai
-import pandas as pd
-import numpy as np
 import re
 from collections import defaultdict
 import time
@@ -13,12 +11,31 @@ from tqdm import tqdm
 import csv
 import os
 import json
+import ast
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+#optional
+try:
+    openai.api_key = os.environ["OPENAI_API_KEY"] # or throws error 
+    openai.api_base = "https://api.openai.com/v1" # you may use localhost or other server
+except KeyError:
+    #openai에서 발급받은 api key를 입력 → https://platform.openai.com/account/api-keys 참조
+    openai.api_key = input("Enter your openai api key : ")
 
-#openai에서 발급받은 api key를 입력 → https://platform.openai.com/account/api-keys 참조
-openai.api_key = input("Input API Key")
+HARDCODED_LIMIT = 10 # prevent any times over than this limit
 # defined as function and returns the result
 
-def getChatCompletionFromTemplate(template:str, inputs:str):
+def getChatCompletionFromTemplate(template:str, inputs:str): # or throws error
+    """
+    get chat completion from template and inputs
+    :param template: template to use
+    :param inputs: inputs to use
+    :return: chat completion result, dict-like object
+    """
+    global HARDCODED_LIMIT
+    if HARDCODED_LIMIT <= 0:
+        raise ValueError("HARDCODED_LIMIT should be positive integer")
+    
+    HARDCODED_LIMIT -= 1
     completion = openai.ChatCompletion.create(
         model = "gpt-3.5-turbo",
         messages = [
@@ -27,7 +44,7 @@ def getChatCompletionFromTemplate(template:str, inputs:str):
         ],
         #max_tokens = 100,
         temperature = 0.05,
-    )
+    ) 
     return completion
 
 # for generating ids
@@ -52,7 +69,9 @@ en_to_kor = {
 # inverse dictionary, Korean to English
 convert_table = {v:k for k, v in en_to_kor.items()}
 
-def translate_keys_recursive(iterable):
+from typing import TypeVar
+T = TypeVar("T")
+def translate_keys_recursive(iterable : T) -> T:
     # using convert_table, translate keys of iterable recursively
     if isinstance(iterable, dict):
         return {convert_table.get(k, k): translate_keys_recursive(v) for k, v in iterable.items()}
@@ -73,14 +92,23 @@ few_shot_template = r"""
 Prompt: "당신은 주어진 자연어 문장에서 주어진 엔티티 레이블 및 관계 레이블을 사용해 개체와 관계를 추출해야 합니다."
 
 엔티티는 반드시 다음 중 정확히 하나의 레이블만을 가져야 합니다.
-
 엔티티 레이블 타입:
-["해군조직", "기타조직", "군인", "군사계급", "군무원", "예비역", "민간인", "사관생도", "사람", "부사관", "준사관", "장교", "병과", "직책", "임무"]
+["해군조직", "기타조직", "군사계급", "군무원", "군인", "민간인", "사관생도", "부사관", "준사관", "장교", "병과", "직책", "임무"]
 
 관계는 반드시 다음 중 정확히 하나의 레이블만을 가져야 합니다.
 관계 레이블은 엔티티 레이블과 겹치지 않습니다.
 관계 레이블 타입:
-["hasSubOrganization", "memberOf", "orgCanControlByPosition", "orgCanControlledByPerson","orgCanControlPerson", "hasRank"]
+["hasSubOrganization", "memberOf", "orgCanControlByPosition", "personCanControlOrg","orgCanControlPerson", "hasRank"]
+
+관계는 다음과 같은 triple을 따릅니다.
+
+(해군조직 또는 기타조직) hasSubOrganization (해군조직 또는 기타조직)
+(군무원 또는 군인 또는 민간인) memberOf (해군조직 또는 기타조직)
+(해군조직) orgCanControlByPosition (군사계급)
+(군사계급) personCanControlOrg (해군조직 또는 기타조직)
+(해군조직) orgCanControlPerson (군무원 또는 군인 또는 민간인)
+(군무원 또는 군인) hasRank (군사계급)
+
 
 형식은 json 형식으로 주의를 기울여 작성해야 합니다.
 반드시 다음과 같은 형식을 따라야 합니다.
@@ -149,6 +177,16 @@ Prompt: "당신은 주어진 자연어 문장에서 주어진 엔티티 레이�
         }
     ]
 }
+
+위의 관계를 추출할 때 다음과 같은 실수를 주의해야 합니다.
+
+ex) "안중근함장 주무관 박성서는 안중근함 대원들의 훈련에 격려를 보냈습니다"
+
+위 문장에서 '안중근함장'은 '안중근함', 즉 안중근 의사와 같은 유명인의 이름을 딴 해군함이므로 엔티티로 인식되어서는 안됩니다.
+또한 안중근함의 경우, '안중근함'을 해군조직으로 인식해야 하며 '함장'은 직책에 해당합니다.
+
+관계 추출시, 반드시 개체로 인식된 엔티티만을 사용해야 합니다.
+모든 유명한 또는 알려진 위인의 이름은 엔티티로 인식되어서는 안됩니다. 예) 유관순, 안중근, 윤봉길
 
 입력: 
     
@@ -270,7 +308,7 @@ def get_article_id(url) -> int:
 
 
 debug_completion_path = "./debug_completion.jsonl"
-def debug_completions(value:dict):
+def debug_completions(value):
     """
     write debug completion to debug_completion_path
     :param value: value to write
@@ -280,12 +318,12 @@ def debug_completions(value:dict):
     with open(debug_completion_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(value, ensure_ascii=False) + "\n")
 
-def getAnalyzation(text:str, base_url:str, article_index = -1) -> dict:
+def getAnalyzation(text_input:str, base_url:str, article_index = -1) -> dict | None:
     """
     get analyzation result from text
     :param text: text to analyze
     :param base_url: base url of text 
-    :return: analyzation result
+    :return: analyzation result or None if failed
 
     :warning: base_url should be specified, because it is used to make url of entity
     :warning: article_index should be modified externally.
@@ -294,26 +332,35 @@ def getAnalyzation(text:str, base_url:str, article_index = -1) -> dict:
     """
     if article_index == -1:
         article_index = get_article_id(base_url)
+    result = None
+    text = ""
     try:
       if DEBUG:
-          result = "\uacb0\uacfc : {\n    \"\uac1c\uccb4_\ud655\uc778_\ud14d\uc2a4\ud2b8\" : \"%\uae40\ub3d9\ud658%(\uc0ac\ub78c, \uad70\uc0ac\uacc4\uae09) %\uc548\uc911\uadfc\ud568\uc7a5%(\uad70\ubb34\uc6d0)\uc740 \u201c%\uc548\uc911\uadfc%(\uc0ac\ub78c, \uc758\uc0ac) \uc758 \ub73b\uc744 \uc774\uc5b4\ubc1b\uc740 %\uc548\uc911\uadfc\ud568%(\ud574\uad70\uc870\uc9c1)\uc740 \uad6d\uac00\uc548\ubcf4\uc758 \ud575\uc2ec \ube44\uc218\ub85c\uc11c \uc5b8\uc81c\u00b7\uc5b4\ub514\uc11c\ub4e0 \uc801\uc744 \uaca9\uce68\ud560 \uc218 \uc788\ub294 \uc804\ud22c\uc900\ube44\ud0dc\uc138\ub97c \uc644\ube44\ud588\ub2e4\u201d\uba70 \u201c\uc548 \uc758\uc0ac\uac00 \uac15\uc870\ud588\ub358 \uc704\uad6d\ud5cc\uc2e0 \uad70\uc778\ubcf8\ubd84\uc758 \uc790\uc138\ub97c \uacac\uc9c0\ud574 \uc2f8\uc6b0\uba74 \ubc18\ub4dc\uc2dc \uc774\uae30\ub294 \ud544\uc2b9\ud574\uad70 \uc804\ud1b5\uc744 \uc774\uc5b4\uac00\uaca0\ub2e4\u201d\uace0 \ub9d0\ud588\ub2e4.\u00a0\",\n    \"\uac1c\uccb4\ub4e4\" : [\n        {\n            \"\uc21c\ucc28\": 1,\n            \"\ub808\uc774\ube14\": \"\uc0ac\ub78c\"\n        },\n        {\n            \"\uc21c\ucc28\": 2,\n            \"\ub808\uc774\ube14\": \"\uad70\uc0ac\uacc4\uae09\"\n        },\n        {\n            \"\uc21c\ucc28\": 3,\n            \"\ub808\uc774\ube14\": \"\uad70\ubb34\uc6d0\"\n        },\n        {\n            \"\uc21c\ucc28\": 4,\n            \"\ub808\uc774\ube14\": \"\uc0ac\ub78c\"\n        },\n        {\n            \"\uc21c\ucc28\": 5,\n            \"\ub808\uc774\ube14\": \"\uc758\uc0ac\"\n        },\n        {\n            \"\uc21c\ucc28\": 6,\n            \"\ub808\uc774\ube14\": \"\ud574\uad70\uc870\uc9c1\"\n        }\n    ],\n    \"\uad00\uacc4\ub4e4\" : [\n        {\n            \"\uc21c\ucc28\": 1,\n            \"\uc720\ud615\": \"hasRank\",\n            \"\uba38\ub9ac\": \"\uae40\ub3d9\ud658\",\n            \"\uaf2c\ub9ac\": \"\uad70\uc0ac\uacc4\uae09\"\n        },\n        {\n            \"\uc21c\ucc28\": 2,\n            \"\uc720\ud615\": \"orgCanControlByPosition\",\n            \"\uba38\ub9ac\": \"\uc548\uc911\uadfc\ud568\",\n            \"\uaf2c\ub9ac\": \"\uad70\ubb34\uc6d0\"\n        },\n        {\n            \"\uc21c\ucc28\": 3,\n            \"\uc720\ud615\": \"hasSubOrganization\",\n            \"\uba38\ub9ac\": \"\uc548\uc911\uadfc\",\n            \"\uaf2c\ub9ac\": \"\uc548\uc911\uadfc\ud568\"\n        },\n        {\n            \"\uc21c\ucc28\": 4,\n            \"\uc720\ud615\": \"orgCanControlPerson\",\n            \"\uba38\ub9ac\": \"\uc548\uc911\uadfc\ud568\",\n            \"\uaf2c\ub9ac\": \"\ud574\uad70\uc870\uc9c1\"\n        }\n    ]\n}"
+        # if debug_completion_path exists, use it
+        if os.path.exists(debug_completion_path):
+            with open(debug_completion_path, "r", encoding="utf-8") as f:
+                result = ast.literal_eval(f.readline())
+                text = result["choices"][0]["message"]["content"]
+        else:
+            text = "\uacb0\uacfc : {\n    \"\uac1c\uccb4_\ud655\uc778_\ud14d\uc2a4\ud2b8\" : \"%\uae40\ub3d9\ud658%(\uc0ac\ub78c, \uad70\uc0ac\uacc4\uae09) %\uc548\uc911\uadfc\ud568\uc7a5%(\uad70\ubb34\uc6d0)\uc740 \u201c%\uc548\uc911\uadfc%(\uc0ac\ub78c, \uc758\uc0ac) \uc758 \ub73b\uc744 \uc774\uc5b4\ubc1b\uc740 %\uc548\uc911\uadfc\ud568%(\ud574\uad70\uc870\uc9c1)\uc740 \uad6d\uac00\uc548\ubcf4\uc758 \ud575\uc2ec \ube44\uc218\ub85c\uc11c \uc5b8\uc81c\u00b7\uc5b4\ub514\uc11c\ub4e0 \uc801\uc744 \uaca9\uce68\ud560 \uc218 \uc788\ub294 \uc804\ud22c\uc900\ube44\ud0dc\uc138\ub97c \uc644\ube44\ud588\ub2e4\u201d\uba70 \u201c\uc548 \uc758\uc0ac\uac00 \uac15\uc870\ud588\ub358 \uc704\uad6d\ud5cc\uc2e0 \uad70\uc778\ubcf8\ubd84\uc758 \uc790\uc138\ub97c \uacac\uc9c0\ud574 \uc2f8\uc6b0\uba74 \ubc18\ub4dc\uc2dc \uc774\uae30\ub294 \ud544\uc2b9\ud574\uad70 \uc804\ud1b5\uc744 \uc774\uc5b4\uac00\uaca0\ub2e4\u201d\uace0 \ub9d0\ud588\ub2e4.\u00a0\",\n    \"\uac1c\uccb4\ub4e4\" : [\n        {\n            \"\uc21c\ucc28\": 1,\n            \"\ub808\uc774\ube14\": \"\uc0ac\ub78c\"\n        },\n        {\n            \"\uc21c\ucc28\": 2,\n            \"\ub808\uc774\ube14\": \"\uad70\uc0ac\uacc4\uae09\"\n        },\n        {\n            \"\uc21c\ucc28\": 3,\n            \"\ub808\uc774\ube14\": \"\uad70\ubb34\uc6d0\"\n        },\n        {\n            \"\uc21c\ucc28\": 4,\n            \"\ub808\uc774\ube14\": \"\uc0ac\ub78c\"\n        },\n        {\n            \"\uc21c\ucc28\": 5,\n            \"\ub808\uc774\ube14\": \"\uc758\uc0ac\"\n        },\n        {\n            \"\uc21c\ucc28\": 6,\n            \"\ub808\uc774\ube14\": \"\ud574\uad70\uc870\uc9c1\"\n        }\n    ],\n    \"\uad00\uacc4\ub4e4\" : [\n        {\n            \"\uc21c\ucc28\": 1,\n            \"\uc720\ud615\": \"hasRank\",\n            \"\uba38\ub9ac\": \"\uae40\ub3d9\ud658\",\n            \"\uaf2c\ub9ac\": \"\uad70\uc0ac\uacc4\uae09\"\n        },\n        {\n            \"\uc21c\ucc28\": 2,\n            \"\uc720\ud615\": \"orgCanControlByPosition\",\n            \"\uba38\ub9ac\": \"\uc548\uc911\uadfc\ud568\",\n            \"\uaf2c\ub9ac\": \"\uad70\ubb34\uc6d0\"\n        },\n        {\n            \"\uc21c\ucc28\": 3,\n            \"\uc720\ud615\": \"hasSubOrganization\",\n            \"\uba38\ub9ac\": \"\uc548\uc911\uadfc\",\n            \"\uaf2c\ub9ac\": \"\uc548\uc911\uadfc\ud568\"\n        },\n        {\n            \"\uc21c\ucc28\": 4,\n            \"\uc720\ud615\": \"orgCanControlPerson\",\n            \"\uba38\ub9ac\": \"\uc548\uc911\uadfc\ud568\",\n            \"\uaf2c\ub9ac\": \"\ud574\uad70\uc870\uc9c1\"\n        }\n    ]\n}"
       else:
-        result = getChatCompletionFromTemplate(few_shot_template, text)
+        result = getChatCompletionFromTemplate(few_shot_template, text_input)
     except Exception as e:
       # if KeyboardInterrupt, raise again
-      if isinstance(e, KeyboardInterrupt):
+      if isinstance(e, KeyboardInterrupt) or isinstance(e, SystemExit) or isinstance(e, MemoryError) or isinstance(e, RuntimeError) or isinstance(e, AssertionError):
         raise e
       print("RateLimitError")
+      # print error
+      print(e)
       return None
     #print(result.choices[0].text)
-    debug_completions(result)
     if not DEBUG:
-        result = result.choices[0]["message"]["content"]
+        debug_completions(result)
+        text = result.choices[0]['message']['content']
     # start from { to }
-    result = result[result.find("{"):result.rfind("}")+1]
+    text = text[text.find("{"):text.rfind("}")+1]
     # using ast.literal_eval parse string to dict
-    import ast
-    result_dict = ast.literal_eval(result)
+    result_dict = ast.literal_eval(text)
     assert type(result_dict) == dict, "result was not valid json format"
     # convert keys and values by given dictionary if found, else use original value
 
@@ -322,6 +369,7 @@ def getAnalyzation(text:str, base_url:str, article_index = -1) -> dict:
     annotation_dict["text"] = text
     # convert list of entity, category, start_offset, end_offset to dictionary
     # using result, get list first
+    assert "annotated_text" in annotation_dict, f"annotated_text not found in result, {annotation_dict}"
     entity_list = detect(annotation_dict["annotated_text"])
     # convert list to dictionary
     # "entities":[{“id”:0,“label”:군무원,“start_offset”:#단어시작위치#,“end_offset”:#단어마지막위치#},…]
@@ -354,7 +402,8 @@ def getAnalyzation(text:str, base_url:str, article_index = -1) -> dict:
 # for each (sentence, url) pair, get annotation
 # then append or save as csv
 
-def process_file_to_jsonl(file_dir : str, result_file_name: str, columns = [1,3], limit = -1, use_rows = False, target_rows = (1,)):
+def process_file_to_jsonl(file_dir : str, result_file_name: str, columns = [1,3], limit = -1, use_rows = False, target_rows = (1,),
+                          use_multithreading:bool = False, num_threads:int = 4):
     """
     process file to jsonl format (listed json)
     :param file_dir: file directory(str of csv)
@@ -363,22 +412,31 @@ def process_file_to_jsonl(file_dir : str, result_file_name: str, columns = [1,3]
     :param limit: limit of rows to process
     :param use_rows: use rows or not
     :param target_rows: rows to use
+    :param use_multithreading: use multithreading or not (Experimental)
     """
     # check if result_file_name ends with .jsonl
     if not result_file_name.endswith(".jsonl"):
         result_file_name += ".jsonl"
 
     SKIPPED_ROWS = []
-    
-    with open(result_file_name, "w", encoding="utf-8") as resultfile:
-        with open(file_dir, "r", encoding="utf-8") as readfile:
-            total_rows = sum(1 for row in readfile)
+
+    with open(file_dir, "r", encoding="utf-8") as readfile:
+        total_rows = sum(1 for row in readfile)
+    # if multithreading, some options may get ignored.
+    if use_multithreading: # not complete
+        # progress bar
+        pbar = tqdm(total = limit if limit != -1 else total_rows - 1)
+        SKIPPED_ROWS = []
+        import threading
+        # for each row, get annotation and write to file with thread number (threading.current_thread().name)
+        # First, split file by url as separate lists. Then, for each list, process in same thread.
+        splitted_rows = defaultdict(list)
         with open(file_dir, "r", encoding="utf-8") as readfile:
             reader = csv.reader(readfile)
             # skip header
             next(reader)
             # for each row, get annotation
-            for i, row in tqdm(enumerate(reader), total = limit if limit != -1 else total_rows - 1):
+            for i, row in enumerate(reader):
                 if use_rows:
                     if i not in target_rows:
                         continue
@@ -388,34 +446,99 @@ def process_file_to_jsonl(file_dir : str, result_file_name: str, columns = [1,3]
                 # check if sentence or url is empty
                 if sentence == "" or url == "":
                     continue
-                # get annotation
-                try:
-                    annotation = getAnalyzation(sentence, url)
-                except Exception as e:
-                    # if KeyboardInterrupt, raise again
-                    if isinstance(e, KeyboardInterrupt):
-                        print("Annotated {} rows".format(i))
-                        return SKIPPED_ROWS
-                    print("Failed annotation at row {}".format(i))
-                    SKIPPED_ROWS.append(i)
-                    annotation = None
-                if annotation is not None:
-                    # append to list
-                    #result.append(annotation)
-                    # write to file
-                    json.dump(annotation, resultfile, ensure_ascii=False)
-                    resultfile.write("\n")
-                else:
-                    # sleep 50ms
-                    time.sleep(0.05)
-                    print("Failed annotation at row {}".format(i))
-                # debug
-                if DEBUG:
-                    print(annotation)
-                    if i > limit:
+                splitted_rows[url].append((i, sentence))
+            def process_rows(url, rows):
+                # ignore limit
+                for i, sentence in rows:
+                    # get annotation
+                    try:
+                        annotation = getAnalyzation(sentence, url)
+                    except Exception as e:
+                        # if KeyboardInterrupt, raise again
+                        if isinstance(e, KeyboardInterrupt):
+                            print("Annotated {} rows".format(i))
+                            return SKIPPED_ROWS
+                        if isinstance(e, KeyboardInterrupt) or isinstance(e, SystemExit) or isinstance(e, MemoryError) or isinstance(e, RuntimeError) or isinstance(e, AssertionError):
+                            raise e
+                        print("Failed annotation at row {}".format(i))
+                        print(e)
+                        SKIPPED_ROWS.append(i)
+                        annotation = None
+                    if annotation is not None:
+                        # append to list
+                        #result.append(annotation)
+                        # write to file
+                        with open(result_file_name, "a", encoding="utf-8") as resultfile:
+                            resultfile.write(json.dumps(annotation, ensure_ascii=False)) 
+                            resultfile.write("\n")
+                    else:
+                        # sleep 50ms
+                        time.sleep(0.05)
+                        print("Failed annotation at row {}".format(i))
+                        print("sleeped 50ms")
+            current_row_count = 0
+            # use ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                for url, rows in splitted_rows.items():
+                    current_row_count += len(rows)
+                    if current_row_count >= limit:
                         break
-                if limit != -1 and i > limit:
+                    print("Processing {} rows in {} thread(s)".format(len(rows), num_threads))
+                    executor.submit(process_rows, url, rows)
+                    # when finished, update progress bar
+                    pbar.update(len(rows))
+            # wait for all threads to finish
+            print("Waiting for all threads to finish...")
+            executor.shutdown(wait=True)
+            return SKIPPED_ROWS
+    with open(file_dir, "r", encoding="utf-8") as readfile:
+        reader = csv.reader(readfile)
+        # skip header
+        next(reader)
+        # for each row, get annotation
+        for i, row in tqdm(enumerate(reader), total = limit if limit != -1 else total_rows - 1):
+            if use_rows:
+                if i not in target_rows:
+                    continue
+            # columns = [1,3] -> select idx 0 = 1, idx 1 = 3 -> url, sentence
+            url = row[columns[0]]
+            sentence = row[columns[1]]
+            # check if sentence or url is empty
+            if sentence == "" or url == "":
+                continue
+            # get annotation
+            try:
+                annotation = getAnalyzation(sentence, url)
+            except Exception as e:
+                # if KeyboardInterrupt, raise again
+                if isinstance(e, KeyboardInterrupt):
+                    print("Annotated {} rows".format(i))
+                    return SKIPPED_ROWS
+                if isinstance(e, KeyboardInterrupt) or isinstance(e, SystemExit) or isinstance(e, MemoryError) or isinstance(e, RuntimeError) or isinstance(e, AssertionError):
+                    raise e
+                print("Failed annotation at row {}".format(i))
+                print(e)
+                SKIPPED_ROWS.append(i)
+                annotation = None
+            if annotation is not None:
+                # append to list
+                #result.append(annotation)
+                # write to file
+                with open(result_file_name, "a", encoding="utf-8") as resultfile:
+                    resultfile.write(json.dumps(annotation, ensure_ascii=False))
+                resultfile.write("\n")
+            else:
+                # sleep 50ms
+                time.sleep(0.05)
+                print("Failed annotation at row {}".format(i))
+                print("Annotation was None")
+            # debug
+            if DEBUG:
+                print(annotation)
+                if i > limit:
                     break
+            if limit != -1 and i > limit:
+                break
     return SKIPPED_ROWS
 
 # TODO : Add argparse
@@ -423,7 +546,9 @@ if __name__ == "__main__":
     # Path to file
     path = r"PATH_TO_FILE_DIR"
     file_name = "FILE_NAME.csv"
-    failed_rows = process_file_to_jsonl(os.path.join(path, file_name), os.path.join(path, "result.jsonl"))
+    failed_rows = process_file_to_jsonl(os.path.join(path, file_name), os.path.join(path, "result.jsonl")
+                                        #, limit=10, use_multithreading=True, num_threads=10 # for multithreading
+                                        )
     import pickle
     with open(os.path.join(path, "failed_rows.pkl"), "wb") as f:
         pickle.dump(failed_rows, f)
